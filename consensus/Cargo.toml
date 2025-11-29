@@ -42,7 +42,3 @@ tracing-subscriber.workspace = true
 [lib]
 bench = false
 crate-type = ["rlib", "cdylib"]
-
-[[bin]]
-name = "minimmit"
-path = "src/minimmit/main.rs"
