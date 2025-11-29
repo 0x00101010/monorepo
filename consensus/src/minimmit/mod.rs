@@ -1,1 +1,2 @@
-mod types;
+pub mod prototype;
+pub mod types;

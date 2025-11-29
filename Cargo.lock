@@ -1128,6 +1128,7 @@ version = "0.0.63"
 dependencies = [
  "bytes",
  "cfg-if",
+ "clap",
  "commonware-broadcast",
  "commonware-codec",
  "commonware-cryptography",

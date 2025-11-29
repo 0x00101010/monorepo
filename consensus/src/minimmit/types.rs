@@ -1,6 +1,6 @@
+use crate::types::{Round, View};
 use commonware_cryptography::{ed25519, Digest};
 use commonware_utils::bitmap::BitMap;
-use crate::types::{Round, View};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vote {
