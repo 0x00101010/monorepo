@@ -125,11 +125,10 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: Signer> Actor<E, C> 
     }
 
     async fn run(mut self) {
-        let mut shutdown = self.context.stopped();
         select_loop! {
-            _ = &mut shutdown => {
+            self.context,
+            on_stopped => {
                 debug!("context shutdown, stopping tracker");
-                break;
             },
             msg = self.receiver.next() => {
                 let Some(msg) = msg else {
@@ -343,7 +342,7 @@ mod tests {
         make_sig_invalid: bool,
     ) -> Info<PublicKey> {
         let peer_info_pk = target_pk_override.unwrap_or_else(|| signer.public_key());
-        let mut signature = signer.sign(Some(ip_namespace), &(socket, timestamp).encode());
+        let mut signature = signer.sign(ip_namespace, &(socket, timestamp).encode());
 
         if make_sig_invalid && !signature.as_ref().is_empty() {
             let mut sig_bytes = signature.encode();

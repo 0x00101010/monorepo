@@ -2,11 +2,8 @@ use crate::{
     // TODO(https://github.com/commonwarexyz/monorepo/issues/1873): support any::fixed::ordered
     adb::{
         self,
-        any::{
-            unordered::{fixed::Any, IndexedLog},
-            AnyDb,
-        },
-        operation::fixed::unordered::Operation,
+        any::unordered::fixed::Any,
+        operation::fixed::{unordered::Operation, Value},
     },
     index::unordered::Index,
     journal::{authenticated, contiguous::fixed},
@@ -27,7 +24,7 @@ impl<E, K, V, H, T> adb::sync::Database for Any<E, K, V, H, T>
 where
     E: Storage + Clock + Metrics,
     K: Array,
-    V: CodecFixed<Cfg = ()>,
+    V: Value,
     H: Hasher,
     T: Translator,
 {
@@ -98,13 +95,13 @@ where
         .await?;
         // Build the snapshot from the log.
         let snapshot = Index::new(context.with_label("snapshot"), db_config.translator.clone());
-        let db = IndexedLog::from_components(range.start, log, snapshot).await?;
+        let db = Self::from_components(range.start, log, snapshot).await?;
 
         Ok(db)
     }
 
     fn root(&self) -> Self::Digest {
-        AnyDb::root(self)
+        self.log.root()
     }
 
     async fn resize_journal(
@@ -265,18 +262,15 @@ mod tests {
     use crate::{
         adb::{
             self,
-            any::{
-                unordered::fixed::{
-                    test::{
-                        any_db_config, apply_ops, create_test_config, create_test_db,
-                        create_test_ops, AnyTest,
-                    },
-                    Any,
+            any::unordered::fixed::{
+                test::{
+                    any_db_config, apply_ops, create_test_config, create_test_db, create_test_ops,
+                    AnyTest,
                 },
-                AnyDb,
+                Any,
             },
             operation::{fixed::unordered::Operation, Keyed as _},
-            store::Db as _,
+            store::CleanStore as _,
             sync::{
                 self,
                 engine::{Config, NextStep},
@@ -328,12 +322,10 @@ mod tests {
     fn test_sync(#[case] target_db_ops: usize, #[case] fetch_batch_size: NonZeroU64) {
         let executor = deterministic::Runner::default();
         executor.start(|mut context| async move {
-            use crate::adb::store::Db as _;
-
             let mut target_db = create_test_db(context.clone()).await;
             let target_db_ops = create_test_ops(target_db_ops);
             apply_ops(&mut target_db, target_db_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
             target_db
                 .prune(target_db.inactivity_floor_loc())
                 .await
@@ -362,7 +354,7 @@ mod tests {
                         expected_kvs.remove(key);
                         deleted_keys.insert(*key);
                     }
-                    Operation::CommitFloor(_) => {
+                    Operation::CommitFloor(_, _) => {
                         // Ignore
                     }
                 }
@@ -416,8 +408,8 @@ mod tests {
             }
             apply_ops(&mut got_db, new_ops.clone()).await;
             apply_ops(&mut *target_db.write().await, new_ops).await;
-            got_db.commit().await.unwrap();
-            target_db.write().await.commit().await.unwrap();
+            got_db.commit(None).await.unwrap();
+            target_db.write().await.commit(None).await.unwrap();
 
             // Verify that the databases match
             for (key, value) in &new_kvs {
@@ -529,7 +521,7 @@ mod tests {
             let target_ops = create_test_ops(TARGET_DB_OPS);
             // Apply all but the last operation
             apply_ops(&mut target_db, target_ops[0..TARGET_DB_OPS - 1].to_vec()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             let upper_bound = target_db.op_count();
             let root = target_db.root();
@@ -538,7 +530,7 @@ mod tests {
             // Add another operation after the sync range
             let final_op = &target_ops[TARGET_DB_OPS - 1];
             apply_ops(&mut target_db, vec![final_op.clone()]).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Start of the sync range is after the inactivity floor
             let config = Config {
@@ -591,8 +583,8 @@ mod tests {
             // Apply the same operations to both databases
             apply_ops(&mut target_db, original_ops.clone()).await;
             apply_ops(&mut sync_db, original_ops.clone()).await;
-            target_db.commit().await.unwrap();
-            sync_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
+            sync_db.commit(None).await.unwrap();
 
             let original_db_op_count = target_db.op_count();
 
@@ -602,7 +594,7 @@ mod tests {
             // Add one more operation and commit the target database
             let last_op = create_test_ops(1);
             apply_ops(&mut target_db, last_op.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
             let root = target_db.root();
             let lower_bound = target_db.inactivity_floor_loc();
             let upper_bound = target_db.op_count();
@@ -690,8 +682,8 @@ mod tests {
             // Apply the same operations to both databases
             apply_ops(&mut target_db, target_ops.clone()).await;
             apply_ops(&mut sync_db, target_ops.clone()).await;
-            target_db.commit().await.unwrap();
-            sync_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
+            sync_db.commit(None).await.unwrap();
 
             target_db
                 .prune(target_db.inactivity_floor_loc())
@@ -758,7 +750,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(50);
             apply_ops(&mut target_db, target_ops).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture initial target state
             let initial_lower_bound = target_db.inactivity_floor_loc();
@@ -819,7 +811,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(50);
             apply_ops(&mut target_db, target_ops).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture initial target state
             let initial_lower_bound = target_db.inactivity_floor_loc();
@@ -879,7 +871,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(100);
             apply_ops(&mut target_db, target_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture initial target state
             let initial_lower_bound = target_db.inactivity_floor_loc();
@@ -889,7 +881,7 @@ mod tests {
             // Apply more operations to the target database
             let more_ops = create_test_ops(1);
             apply_ops(&mut target_db, more_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture final target state
             let final_lower_bound = target_db.inactivity_floor_loc();
@@ -951,7 +943,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(50);
             apply_ops(&mut target_db, target_ops).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture initial target state
             let initial_lower_bound = target_db.inactivity_floor_loc();
@@ -1009,7 +1001,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(10);
             apply_ops(&mut target_db, target_ops).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture target state
             let lower_bound = target_db.inactivity_floor_loc();
@@ -1084,7 +1076,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(initial_ops);
             apply_ops(&mut target_db, target_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture initial target state
             let initial_lower_bound = target_db.inactivity_floor_loc();
@@ -1130,7 +1122,7 @@ mod tests {
             let new_root = {
                 let mut db = target_db.write().await;
                 apply_ops(&mut db, additional_ops).await;
-                db.commit().await.unwrap();
+                db.commit(None).await.unwrap();
 
                 // Capture new target state
                 let new_lower_bound = db.inactivity_floor_loc();
@@ -1156,10 +1148,10 @@ mod tests {
             assert_eq!(synced_db.root(), new_root);
 
             // Verify the target database matches the synced database
-            let target_db = match Arc::try_unwrap(target_db) {
-                Ok(rw_lock) => rw_lock.into_inner(),
-                Err(_) => panic!("Failed to unwrap Arc - still has references"),
-            };
+            let target_db = Arc::try_unwrap(target_db).map_or_else(
+                |_| panic!("Failed to unwrap Arc - still has references"),
+                |rw_lock| rw_lock.into_inner(),
+            );
             {
                 assert_eq!(synced_db.op_count(), target_db.op_count());
                 assert_eq!(
@@ -1208,7 +1200,7 @@ mod tests {
             let mut target_db = create_test_db(context.clone()).await;
             let target_ops = create_test_ops(10);
             apply_ops(&mut target_db, target_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture target state
             let target_root = target_db.root();
@@ -1342,7 +1334,7 @@ mod tests {
 
             synced_db.update(key1, value1).await.unwrap();
             synced_db.update(key2, value2).await.unwrap();
-            synced_db.commit().await.unwrap();
+            synced_db.commit(None).await.unwrap();
 
             // Verify the operations worked
             assert_eq!(synced_db.get(&key1).await.unwrap(), Some(value1));
@@ -1364,7 +1356,7 @@ mod tests {
             let mut source_db = create_test_db(context.clone()).await;
             let ops = create_test_ops(NUM_OPS);
             apply_ops(&mut source_db, ops.clone()).await;
-            source_db.commit().await.unwrap();
+            source_db.commit(None).await.unwrap();
             source_db
                 .prune(source_db.inactivity_floor_loc())
                 .await
@@ -1464,7 +1456,7 @@ mod tests {
             let mut source_db = create_test_db(context.clone()).await;
             let ops = create_test_ops(200);
             apply_ops(&mut source_db, ops.clone()).await;
-            source_db.commit().await.unwrap();
+            source_db.commit(None).await.unwrap();
 
             let total_ops = source_db.op_count();
 
@@ -1565,13 +1557,13 @@ mod tests {
                 .unwrap();
             let original_ops = create_test_ops(NUM_OPS);
             apply_ops(&mut target_db, original_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
             target_db
                 .prune(target_db.inactivity_floor_loc())
                 .await
                 .unwrap();
             apply_ops(&mut sync_db, original_ops.clone()).await;
-            sync_db.commit().await.unwrap();
+            sync_db.commit(None).await.unwrap();
             sync_db.prune(sync_db.inactivity_floor_loc()).await.unwrap();
             let sync_db_original_size = sync_db.op_count();
 
@@ -1587,7 +1579,7 @@ mod tests {
             // Add one more operation to the target db
             let more_ops = create_test_ops(NUM_ADDITIONAL_OPS);
             apply_ops(&mut target_db, more_ops.clone()).await;
-            target_db.commit().await.unwrap();
+            target_db.commit(None).await.unwrap();
 
             // Capture target db state for comparison
             let target_db_op_count = target_db.op_count();
@@ -1665,7 +1657,7 @@ mod tests {
             let mut db = Any::init(context.clone(), db_config.clone()).await.unwrap();
             let ops = create_test_ops(100);
             apply_ops(&mut db, ops.clone()).await;
-            db.commit().await.unwrap();
+            db.commit(None).await.unwrap();
 
             let sync_lower_bound = db.inactivity_floor_loc();
             let sync_upper_bound = db.op_count();

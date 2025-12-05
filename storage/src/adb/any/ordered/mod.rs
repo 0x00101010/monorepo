@@ -1,10 +1,10 @@
 use crate::{
     adb::{
-        any::AnyDb,
+        any::{CleanAny, DirtyAny},
         build_snapshot_from_log,
-        operation::{Committable, KeyData, Keyed},
-        store::Db,
-        Error, FloorHelper,
+        operation::{Committable, KeyData, Keyed, Ordered},
+        store::{Batchable, LogStore},
+        update_known_loc, Error, FloorHelper,
     },
     index::{Cursor as _, Ordered as Index},
     journal::{
@@ -12,17 +12,18 @@ use crate::{
         contiguous::{MutableContiguous, PersistableContiguous},
     },
     mmr::{
-        mem::{Clean, State},
+        mem::{Clean, Dirty, State},
         Location, Proof,
     },
     AuthenticatedBitMap,
 };
 use commonware_cryptography::{Digest, DigestOf, Hasher};
 use commonware_runtime::{Clock, Metrics, Storage};
-use core::num::NonZeroU64;
+use core::{num::NonZeroU64, ops::Range};
 use tracing::debug;
 
 pub mod fixed;
+pub mod variable;
 
 type Key<T> = <T as Keyed>::Key;
 type Value<T> = <T as Keyed>::Value;
@@ -32,7 +33,7 @@ type AuthenticatedLog<E, C, H, S = Clean<DigestOf<H>>> = authenticated::Journal<
 type LocatedKey<K, V> = (Location, KeyData<K, V>);
 
 /// A trait implemented by the ordered Any db operation type.
-pub trait Operation: Committable + Keyed {
+pub trait Operation: Committable + Keyed + Ordered {
     /// Return a new update operation variant.
     fn new_update(key: Self::Key, value: Self::Value, next_key: Self::Key) -> Self;
 
@@ -40,14 +41,7 @@ pub trait Operation: Committable + Keyed {
     fn new_delete(key: Self::Key) -> Self;
 
     /// Return a new commit-floor operation variant.
-    fn new_commit_floor(inactivity_floor_loc: Location) -> Self;
-
-    /// Return this operation's key data, or None if this operation variant doesn't have any.
-    fn key_data(&self) -> Option<&KeyData<Self::Key, Self::Value>>;
-
-    /// Convert this operation into its key data, or None if this operation variant doesn't have
-    /// any.
-    fn into_key_data(self) -> Option<KeyData<Self::Key, Self::Value>>;
+    fn new_commit_floor(metadata: Option<Self::Value>, inactivity_floor_loc: Location) -> Self;
 }
 
 /// The return type of the `Any::update_loc` method.
@@ -107,11 +101,20 @@ impl<
         S: State<DigestOf<H>>,
     > IndexedLog<E, C, I, H, S>
 {
-    fn op_count(&self) -> Location {
+    /// The number of operations that have been applied to this db, including those that have been
+    /// pruned and those that are not yet committed.
+    pub fn op_count(&self) -> Location {
         self.log.size()
     }
 
-    fn is_empty(&self) -> bool {
+    /// Return the inactivity floor location. This is the location before which all operations are
+    /// known to be inactive. Operations before this point can be safely pruned.
+    pub const fn inactivity_floor_loc(&self) -> Location {
+        self.inactivity_floor_loc
+    }
+
+    /// Whether the snapshot currently has no active keys.
+    pub const fn is_empty(&self) -> bool {
         self.active_keys == 0
     }
 
@@ -285,20 +288,6 @@ impl<
         self.log.pruning_boundary()
     }
 
-    /// For the given `key` which is known to exist in the snapshot with location `old_loc`, update
-    /// its location to `new_loc`.
-    fn update_known_loc(&mut self, key: &Key<C::Item>, old_loc: Location, new_loc: Location) {
-        let mut cursor = self
-            .snapshot
-            .get_mut(key)
-            .expect("key should be known to exist");
-        assert!(
-            cursor.find(|&loc| *loc == old_loc),
-            "prev_key with given old_loc should have been found"
-        );
-        cursor.update(new_loc);
-    }
-
     /// Finds and updates the location of the previous key to `key` in the snapshot for cases where
     /// the previous key does not share the same translated key, returning an UpdateLocResult
     /// indicating the specific outcome.
@@ -316,7 +305,7 @@ impl<
         let iter = self.snapshot.prev_translated_key(key);
         if let Some((loc, prev_key)) = self.last_key_in_iter(iter).await? {
             callback(Some(loc));
-            self.update_known_loc(&prev_key.key, loc, next_loc);
+            update_known_loc(&mut self.snapshot, &prev_key.key, loc, next_loc);
             return Ok(UpdateLocResult::NotExists(prev_key));
         }
 
@@ -326,7 +315,7 @@ impl<
         let (loc, last_key) = last_key.expect("no last key found in non-empty snapshot");
 
         callback(Some(loc));
-        self.update_known_loc(&last_key.key, loc, next_loc);
+        update_known_loc(&mut self.snapshot, &last_key.key, loc, next_loc);
 
         Ok(UpdateLocResult::NotExists(last_key))
     }
@@ -586,13 +575,56 @@ impl<
 
         let loc = self.op_count();
         callback(true, Some(prev_key.0));
-        self.update_known_loc(&prev_key.1, prev_key.0, loc);
+        update_known_loc(&mut self.snapshot, &prev_key.1, prev_key.0, loc);
 
         let op = C::Item::new_update(prev_key.1, prev_key.2, next_key);
         self.log.append(op).await?;
         self.steps += 1;
 
         Ok(())
+    }
+
+    /// Get the value of `key` in the db, or None if it has no value.
+    pub async fn get(&self, key: &Key<C::Item>) -> Result<Option<Value<C::Item>>, Error> {
+        self.get_key_op_loc(key)
+            .await
+            .map(|op| op.map(|(v, _)| v.into_value().expect("update operation must have value")))
+    }
+
+    /// Get the metadata associated with the last commit, or None if no commit has been made.
+    pub async fn get_metadata(&self) -> Result<Option<Value<C::Item>>, Error> {
+        let Some(last_commit) = self.last_commit else {
+            return Ok(None);
+        };
+
+        let op = self.log.read(last_commit).await?;
+        Ok(op.into_value())
+    }
+
+    /// Updates `key` to have value `value`. The operation is reflected in the snapshot, but will be
+    /// subject to rollback until the next successful `commit`.
+    pub async fn update(&mut self, key: Key<C::Item>, value: Value<C::Item>) -> Result<(), Error> {
+        self.update_with_callback(key, value, |_| {}).await
+    }
+
+    /// Creates a new key-value pair in the db. The operation is reflected in the snapshot, but will
+    /// be subject to rollback until the next successful `commit`. Returns true if the key was
+    /// created, false if it already existed.
+    pub async fn create(
+        &mut self,
+        key: Key<C::Item>,
+        value: Value<C::Item>,
+    ) -> Result<bool, Error> {
+        self.create_with_callback(key, value, |_| {}).await
+    }
+
+    /// Delete `key` and its value from the db. Deleting a key that already has no value is a no-op.
+    /// The operation is reflected in the snapshot, but will be subject to rollback until the next
+    /// successful `commit`. Returns true if the key was deleted, false if it was already inactive.
+    pub async fn delete(&mut self, key: Key<C::Item>) -> Result<bool, Error> {
+        let mut r = false;
+        self.delete_with_callback(key, |_, _| r = true).await?;
+        Ok(r)
     }
 }
 
@@ -687,7 +719,9 @@ impl<
     }
 
     /// Returns a FloorHelper wrapping the current state of the log.
-    pub(crate) fn as_floor_helper(&mut self) -> FloorHelper<'_, I, AuthenticatedLog<E, C, H>> {
+    pub(crate) const fn as_floor_helper(
+        &mut self,
+    ) -> FloorHelper<'_, I, AuthenticatedLog<E, C, H>> {
         FloorHelper {
             snapshot: &mut self.snapshot,
             log: &mut self.log,
@@ -726,6 +760,74 @@ impl<
 
         Ok(())
     }
+
+    /// Commit any pending operations to the database, ensuring their durability upon return from
+    /// this function. Also raises the inactivity floor according to the schedule. Returns the
+    /// `(start_loc, end_loc]` location range of committed operations.
+    pub async fn commit(
+        &mut self,
+        metadata: Option<Value<C::Item>>,
+    ) -> Result<Range<Location>, Error> {
+        let start_loc = self
+            .last_commit
+            .map_or_else(|| Location::new_unchecked(0), |last_commit| last_commit + 1);
+
+        let inactivity_floor_loc = self.raise_floor().await?;
+
+        // Append the commit operation with the new inactivity floor.
+        self.apply_commit_op(C::Item::new_commit_floor(metadata, inactivity_floor_loc))
+            .await?;
+
+        Ok(start_loc..self.op_count())
+    }
+
+    /// Sync all database state to disk.
+    pub async fn sync(&mut self) -> Result<(), Error> {
+        self.log.sync().await.map_err(Into::into)
+    }
+
+    /// Prunes historical operations prior to `prune_loc`. This does not affect the db's root or
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [Error::PruneBeyondMinRequired] if `prune_loc` > inactivity floor.
+    /// - Returns [crate::mmr::Error::LocationOverflow] if `prune_loc` > [crate::mmr::MAX_LOCATION].
+    pub async fn prune(&mut self, prune_loc: Location) -> Result<(), Error> {
+        if prune_loc > self.inactivity_floor_loc {
+            return Err(Error::PruneBeyondMinRequired(
+                prune_loc,
+                self.inactivity_floor_loc,
+            ));
+        }
+
+        self.log.prune(prune_loc).await?;
+
+        Ok(())
+    }
+
+    /// Close the db. Operations that have not been committed will be lost or rolled back on
+    /// restart.
+    pub async fn close(self) -> Result<(), Error> {
+        self.log.close().await.map_err(Into::into)
+    }
+
+    /// Destroy the db, removing all data from disk.
+    pub async fn destroy(self) -> Result<(), Error> {
+        self.log.destroy().await.map_err(Into::into)
+    }
+
+    /// Convert this database into its dirty counterpart for batched updates.
+    pub fn into_dirty(self) -> IndexedLog<E, C, I, H, Dirty> {
+        IndexedLog {
+            log: self.log.into_dirty(),
+            inactivity_floor_loc: self.inactivity_floor_loc,
+            last_commit: self.last_commit,
+            snapshot: self.snapshot,
+            steps: self.steps,
+            active_keys: self.active_keys,
+        }
+    }
 }
 
 impl<
@@ -733,29 +835,68 @@ impl<
         C: PersistableContiguous<Item: Operation>,
         I: Index<Value = Location>,
         H: Hasher,
-    > AnyDb<C::Item, H::Digest> for IndexedLog<E, C, I, H>
+    > IndexedLog<E, C, I, H, Dirty>
 {
-    /// Returns the root of the authenticated log.
+    /// Merkleize the database and compute the root digest.
+    pub fn merkleize(self) -> IndexedLog<E, C, I, H, Clean<H::Digest>> {
+        IndexedLog {
+            log: self.log.merkleize(),
+            inactivity_floor_loc: self.inactivity_floor_loc,
+            last_commit: self.last_commit,
+            snapshot: self.snapshot,
+            steps: self.steps,
+            active_keys: self.active_keys,
+        }
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::store::StorePersistable for IndexedLog<E, C, I, H>
+{
+    async fn commit(&mut self) -> Result<(), Error> {
+        self.commit(None).await.map(|_| ())
+    }
+
+    async fn destroy(self) -> Result<(), Error> {
+        self.destroy().await
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::adb::store::LogStorePrunable for IndexedLog<E, C, I, H>
+{
+    async fn prune(&mut self, prune_loc: Location) -> Result<(), Error> {
+        self.prune(prune_loc).await
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::adb::store::CleanStore for IndexedLog<E, C, I, H>
+{
+    type Digest = H::Digest;
+    type Operation = C::Item;
+    type Dirty = IndexedLog<E, C, I, H, Dirty>;
+
+    fn into_dirty(self) -> Self::Dirty {
+        self.into_dirty()
+    }
+
     fn root(&self) -> H::Digest {
         self.log.root()
     }
 
-    /// Whether the snapshot currently has no active keys.
-    fn is_empty(&self) -> bool {
-        self.active_keys == 0
-    }
-
-    /// Generate and return:
-    ///  1. a proof of all operations applied to the db in the range starting at (and including)
-    ///     location `start_loc`, and ending at the first of either:
-    ///     - the last operation performed, or
-    ///     - the operation `max_ops` from the start.
-    ///  2. the operations corresponding to the leaves in this range.
-    ///
-    /// # Errors
-    ///
-    /// Returns [crate::mmr::Error::LocationOverflow] if `start_loc` > [crate::mmr::MAX_LOCATION].
-    /// Returns [crate::mmr::Error::RangeOutOfBounds] if `start_loc` >= `op_count`.
     async fn proof(
         &self,
         start_loc: Location,
@@ -765,12 +906,6 @@ impl<
         self.historical_proof(size, start_loc, max_ops).await
     }
 
-    /// Returns a proof of inclusion of all operations in the range starting at (and including)
-    /// location `start_loc`, and ending at the first of either:
-    /// - the last operation performed, or
-    /// - the operation `max_ops` from the start.
-    ///
-    /// Also returns a vector of operations corresponding to this range.
     async fn historical_proof(
         &self,
         historical_size: Location,
@@ -789,74 +924,391 @@ impl<
         C: PersistableContiguous<Item: Operation>,
         I: Index<Value = Location>,
         H: Hasher,
-    > Db<Key<C::Item>, Value<C::Item>> for IndexedLog<E, C, I, H>
+        S: State<DigestOf<H>>,
+    > LogStore for IndexedLog<E, C, I, H, S>
 {
+    type Value = Value<C::Item>;
+
     fn op_count(&self) -> Location {
-        self.log.size()
+        self.op_count()
     }
 
     fn inactivity_floor_loc(&self) -> Location {
-        self.inactivity_floor_loc
+        self.inactivity_floor_loc()
     }
 
-    async fn get(&self, key: &Key<C::Item>) -> Result<Option<Value<C::Item>>, Error> {
-        self.get_key_op_loc(key)
-            .await
-            .map(|op| op.map(|(v, _)| v.into_value().expect("update operation must have value")))
+    async fn get_metadata(&self) -> Result<Option<Value<C::Item>>, Error> {
+        self.get_metadata().await
     }
 
-    async fn update(&mut self, key: Key<C::Item>, value: Value<C::Item>) -> Result<(), Error> {
-        self.update_with_callback(key, value, |_| {}).await
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::store::Store for IndexedLog<E, C, I, H>
+{
+    type Key = Key<C::Item>;
+    type Value = Value<C::Item>;
+    type Error = Error;
+
+    async fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, Self::Error> {
+        self.get(key).await
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::store::StoreMut for IndexedLog<E, C, I, H>
+{
+    async fn update(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Self::Error> {
+        self.update(key, value).await
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::store::StoreDeletable for IndexedLog<E, C, I, H>
+{
+    async fn delete(&mut self, key: Self::Key) -> Result<bool, Self::Error> {
+        self.delete(key).await
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > crate::adb::store::DirtyStore for IndexedLog<E, C, I, H, Dirty>
+{
+    type Digest = H::Digest;
+    type Operation = C::Item;
+    type Clean = IndexedLog<E, C, I, H>;
+
+    fn merkleize(self) -> Self::Clean {
+        self.merkleize()
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > CleanAny for IndexedLog<E, C, I, H>
+{
+    type Key = Key<C::Item>;
+
+    async fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, Error> {
+        self.get(key).await
     }
 
-    async fn create(&mut self, key: Key<C::Item>, value: Value<C::Item>) -> Result<bool, Error> {
-        self.create_with_callback(key, value, |_| {}).await
-    }
-
-    async fn delete(&mut self, key: Key<C::Item>) -> Result<bool, Error> {
-        let mut r = false;
-        self.delete_with_callback(key, |_, _| r = true).await?;
-
-        Ok(r)
-    }
-
-    async fn commit(&mut self) -> Result<(), Error> {
-        let inactivity_floor_loc = self.raise_floor().await?;
-
-        // Append the commit operation with the new inactivity floor.
-        self.apply_commit_op(C::Item::new_commit_floor(inactivity_floor_loc))
-            .await
+    async fn commit(&mut self, metadata: Option<Self::Value>) -> Result<Range<Location>, Error> {
+        self.commit(metadata).await
     }
 
     async fn sync(&mut self) -> Result<(), Error> {
-        self.log.sync().await.map_err(Into::into)
+        self.sync().await
     }
 
-    /// Prunes historical operations prior to `prune_loc`. This does not affect the db's root or
-    /// snapshot.
-    ///
-    /// # Errors
-    ///
-    /// - Returns [Error::PruneBeyondMinRequired] if `prune_loc` > inactivity floor.
-    /// - Returns [crate::mmr::Error::LocationOverflow] if `prune_loc` > [crate::mmr::MAX_LOCATION].
     async fn prune(&mut self, prune_loc: Location) -> Result<(), Error> {
-        if prune_loc > self.inactivity_floor_loc {
-            return Err(Error::PruneBeyondMinRequired(
-                prune_loc,
-                self.inactivity_floor_loc,
-            ));
-        }
-
-        self.log.prune(prune_loc).await?;
-
-        Ok(())
+        self.prune(prune_loc).await
     }
 
     async fn close(self) -> Result<(), Error> {
-        self.log.close().await.map_err(Into::into)
+        self.close().await
     }
 
     async fn destroy(self) -> Result<(), Error> {
-        self.log.destroy().await.map_err(Into::into)
+        self.destroy().await
+    }
+}
+
+impl<
+        E: Storage + Clock + Metrics,
+        C: PersistableContiguous<Item: Operation>,
+        I: Index<Value = Location>,
+        H: Hasher,
+    > DirtyAny for IndexedLog<E, C, I, H, Dirty>
+{
+    type Key = Key<C::Item>;
+
+    async fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, Error> {
+        self.get(key).await
+    }
+
+    async fn update(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Error> {
+        self.update(key, value).await
+    }
+
+    async fn create(&mut self, key: Self::Key, value: Self::Value) -> Result<bool, Error> {
+        self.create(key, value).await
+    }
+
+    async fn delete(&mut self, key: Self::Key) -> Result<bool, Error> {
+        self.delete(key).await
+    }
+}
+
+impl<E, C, I, H> Batchable for IndexedLog<E, C, I, H>
+where
+    E: Storage + Clock + Metrics,
+    C: PersistableContiguous<Item: Operation>,
+    I: Index<Value = Location>,
+    H: Hasher,
+{
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::{
+        adb::{
+            any::test::{fixed_db_config, variable_db_config},
+            store::DirtyStore as _,
+        },
+        mmr::{mem::Mmr as MemMmr, StandardHasher as Standard},
+        translator::TwoCap,
+    };
+    use commonware_cryptography::{sha256::Digest, Sha256};
+    use commonware_macros::test_traced;
+    use commonware_runtime::{
+        deterministic::{Context, Runner},
+        Runner as _,
+    };
+    use core::{future::Future, pin::Pin};
+
+    /// A type alias for the concrete [Any] type used in these unit tests.
+    type FixedDb = fixed::Any<Context, Digest, Digest, Sha256, TwoCap>;
+
+    /// A type alias for the concrete [Any] type used in these unit tests.
+    type VariableDb = variable::Any<Context, Digest, Digest, Sha256, TwoCap, Clean<Digest>>;
+
+    /// Return an `Any` database initialized with a fixed config.
+    async fn open_fixed_db(context: Context) -> FixedDb {
+        FixedDb::init(context, fixed_db_config("partition"))
+            .await
+            .unwrap()
+    }
+
+    /// Return an `Any` database initialized with a variable config.
+    async fn open_variable_db(context: Context) -> VariableDb {
+        VariableDb::init(context, variable_db_config("partition"))
+            .await
+            .unwrap()
+    }
+
+    async fn test_ordered_any_db_empty<D>(
+        context: Context,
+        mut db: D,
+        reopen_db: impl Fn(Context) -> Pin<Box<dyn Future<Output = D> + Send>>,
+    ) where
+        D: CleanAny<Key = Digest, Value = Digest, Digest = Digest>,
+    {
+        let mut hasher = Standard::<Sha256>::new();
+        assert_eq!(db.op_count(), 0);
+        assert!(db.get_metadata().await.unwrap().is_none());
+        assert!(matches!(db.prune(db.inactivity_floor_loc()).await, Ok(())));
+        assert_eq!(
+            &db.root(),
+            MemMmr::default().merkleize(&mut hasher, None).root()
+        );
+
+        // Make sure closing/reopening gets us back to the same state, even after adding an
+        // uncommitted op, and even without a clean shutdown.
+        let d1 = Sha256::fill(1u8);
+        let d2 = Sha256::fill(2u8);
+        let root = db.root();
+        let mut db = db.into_dirty();
+        db.update(d1, d2).await.unwrap();
+        let mut db = reopen_db(context.clone()).await;
+        assert_eq!(db.root(), root);
+        assert_eq!(db.op_count(), 0);
+
+        // Test calling commit on an empty db which should make it (durably) non-empty.
+        let metadata = Sha256::fill(3u8);
+        let range = db.commit(Some(metadata)).await.unwrap();
+        assert_eq!(range.start, Location::new_unchecked(0));
+        assert_eq!(range.end, Location::new_unchecked(1));
+        assert_eq!(db.op_count(), 1); // floor op added
+        assert_eq!(db.get_metadata().await.unwrap(), Some(metadata));
+        let root = db.root();
+        assert!(matches!(db.prune(db.inactivity_floor_loc()).await, Ok(())));
+
+        // Re-opening the DB without a clean shutdown should still recover the correct state.
+        let mut db = reopen_db(context.clone()).await;
+        assert_eq!(db.op_count(), 1);
+        assert_eq!(db.get_metadata().await.unwrap(), Some(metadata));
+        assert_eq!(db.root(), root);
+
+        // Confirm the inactivity floor doesn't fall endlessly behind with multiple commits.
+        for _ in 1..100 {
+            db.commit(None).await.unwrap();
+            assert_eq!(db.op_count() - 1, db.inactivity_floor_loc());
+        }
+
+        db.destroy().await.unwrap();
+    }
+
+    #[test_traced("WARN")]
+    fn test_ordered_any_fixed_db_empty() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            let db = open_fixed_db(context.clone()).await;
+            test_ordered_any_db_empty(context, db, |ctx| Box::pin(open_fixed_db(ctx))).await;
+        });
+    }
+
+    #[test_traced("WARN")]
+    fn test_ordered_any_variable_db_empty() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            let db = open_variable_db(context.clone()).await;
+            test_ordered_any_db_empty(context, db, |ctx| Box::pin(open_variable_db(ctx))).await;
+        });
+    }
+
+    async fn test_ordered_any_db_basic<D>(
+        context: Context,
+        db: D,
+        reopen_db: impl Fn(Context) -> Pin<Box<dyn Future<Output = D> + Send>>,
+    ) where
+        D: CleanAny<Key = Digest, Value = Digest, Digest = Digest>,
+    {
+        // Build a db with 2 keys and make sure updates and deletions of those keys work as
+        // expected.
+        let key1 = Sha256::fill(1u8);
+        let key2 = Sha256::fill(2u8);
+        let val1 = Sha256::fill(3u8);
+        let val2 = Sha256::fill(4u8);
+
+        assert!(db.get(&key1).await.unwrap().is_none());
+        assert!(db.get(&key2).await.unwrap().is_none());
+
+        let mut db = db.into_dirty();
+        assert!(db.create(key1, val1).await.unwrap());
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), val1);
+        assert!(db.get(&key2).await.unwrap().is_none());
+
+        assert!(db.create(key2, val2).await.unwrap());
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), val1);
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), val2);
+
+        db.delete(key1).await.unwrap();
+        assert!(db.get(&key1).await.unwrap().is_none());
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), val2);
+
+        let new_val = Sha256::fill(5u8);
+        db.update(key1, new_val).await.unwrap();
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), new_val);
+
+        db.update(key2, new_val).await.unwrap();
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), new_val);
+
+        // 2 new keys (4 ops), 2 updates (2 ops), 1 deletion (2 ops) = 8 ops
+        assert_eq!(db.op_count(), 8);
+        assert_eq!(db.inactivity_floor_loc(), Location::new_unchecked(0));
+        let mut db = db.merkleize();
+        db.commit(None).await.unwrap();
+        let mut db = db.into_dirty();
+
+        // Make sure create won't modify active keys.
+        assert!(!db.create(key1, val1).await.unwrap());
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), new_val);
+
+        // Delete all keys.
+        assert!(db.delete(key1).await.unwrap());
+        assert!(db.delete(key2).await.unwrap());
+        assert!(db.get(&key1).await.unwrap().is_none());
+        assert!(db.get(&key2).await.unwrap().is_none());
+
+        let mut db = db.merkleize();
+        db.commit(None).await.unwrap();
+        let root = db.root();
+
+        // Multiple deletions of the same key should be a no-op.
+        let prev_op_count = db.op_count();
+        let mut db = db.into_dirty();
+        assert!(!db.delete(key1).await.unwrap());
+        assert_eq!(db.op_count(), prev_op_count);
+        let db = db.merkleize();
+        assert_eq!(db.root(), root);
+        let mut db = db.into_dirty();
+
+        // Deletions of non-existent keys should be a no-op.
+        let key3 = Sha256::fill(6u8);
+        assert!(!db.delete(key3).await.unwrap());
+        assert_eq!(db.op_count(), prev_op_count);
+
+        // Make sure closing/reopening gets us back to the same state.
+        let mut db = db.merkleize();
+        db.commit(None).await.unwrap();
+        let op_count = db.op_count();
+        let root = db.root();
+        let db = reopen_db(context.clone()).await;
+        assert_eq!(db.op_count(), op_count);
+        assert_eq!(db.root(), root);
+        let mut db = db.into_dirty();
+
+        // Re-activate the keys by updating them.
+        db.update(key1, val1).await.unwrap();
+        db.update(key2, val2).await.unwrap();
+        db.delete(key1).await.unwrap();
+        db.update(key2, val1).await.unwrap();
+        db.update(key1, val2).await.unwrap();
+
+        let mut db = db.merkleize();
+        db.commit(None).await.unwrap();
+
+        // Confirm close/reopen gets us back to the same state.
+        let op_count = db.op_count();
+        let root = db.root();
+        let mut db = reopen_db(context.clone()).await;
+
+        assert_eq!(db.root(), root);
+        assert_eq!(db.op_count(), op_count);
+
+        // Commit will raise the inactivity floor, which won't affect state but will affect the
+        // root.
+        db.commit(None).await.unwrap();
+
+        assert!(db.root() != root);
+
+        // Pruning inactive ops should not affect current state or root.
+        let root = db.root();
+        db.prune(db.inactivity_floor_loc()).await.unwrap();
+        assert_eq!(db.root(), root);
+
+        db.destroy().await.unwrap();
+    }
+
+    #[test_traced("WARN")]
+    fn test_ordered_any_fixed_db_basic() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            let db = open_fixed_db(context.clone()).await;
+            test_ordered_any_db_basic(context, db, |ctx| Box::pin(open_fixed_db(ctx))).await;
+        });
+    }
+
+    #[test_traced("WARN")]
+    fn test_ordered_any_variable_db_basic() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            let db = open_variable_db(context.clone()).await;
+            test_ordered_any_db_basic(context, db, |ctx| Box::pin(open_variable_db(ctx))).await;
+        });
     }
 }

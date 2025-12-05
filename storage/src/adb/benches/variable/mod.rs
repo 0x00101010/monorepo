@@ -5,7 +5,7 @@ use commonware_runtime::{buffer::PoolRef, create_pool, tokio::Context, ThreadPoo
 use commonware_storage::{
     adb::{
         any::{unordered::variable::Any, VariableConfig as AConfig},
-        store::{Batchable, Config as SConfig, Db, Store},
+        store::{Batchable, Config as SConfig, LogStorePrunable, Store},
     },
     translator::EightCap,
 };
@@ -23,10 +23,10 @@ enum Variant {
 }
 
 impl Variant {
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
-            Variant::Store => "store",
-            Variant::Any => "any",
+            Self::Store => "store",
+            Self::Any => "any",
         }
     }
 }
@@ -100,12 +100,21 @@ async fn get_any(ctx: Context) -> AnyDb {
 /// `num_operations` over these elements, each selected uniformly at random for each operation. The
 /// ratio of updates to deletes is configured with `DELETE_FREQUENCY`. The database is committed
 /// after every `commit_frequency` operations.
-async fn gen_random_kv<A: Db<<Sha256 as Hasher>::Digest, Vec<u8>>>(
+async fn gen_random_kv<A>(
     mut db: A,
     num_elements: u64,
     num_operations: u64,
     commit_frequency: u32,
-) -> A {
+) -> A
+where
+    A: commonware_storage::store::Store<
+            Key = <Sha256 as Hasher>::Digest,
+            Value = Vec<u8>,
+            Error: std::fmt::Debug,
+        > + LogStorePrunable
+        + commonware_storage::store::StorePersistable
+        + commonware_storage::store::StoreDeletable,
+{
     // Insert a random value for every possible element into the db.
     let mut rng = StdRng::seed_from_u64(42);
     for i in 0u64..num_elements {
@@ -128,20 +137,23 @@ async fn gen_random_kv<A: Db<<Sha256 as Hasher>::Digest, Vec<u8>>>(
         }
     }
     db.commit().await.unwrap();
-    db.sync().await.unwrap();
     db.prune(db.inactivity_floor_loc()).await.unwrap();
 
     db
 }
 
-async fn gen_random_kv_batched<
-    A: Db<<Sha256 as Hasher>::Digest, Vec<u8>> + Batchable<<Sha256 as Hasher>::Digest, Vec<u8>>,
->(
+async fn gen_random_kv_batched<A>(
     mut db: A,
     num_elements: u64,
     num_operations: u64,
     commit_frequency: u32,
-) -> A {
+) -> A
+where
+    A: Batchable
+        + commonware_storage::store::Store<Key = <Sha256 as Hasher>::Digest, Value = Vec<u8>>
+        + commonware_storage::store::StorePersistable
+        + LogStorePrunable<Value = Vec<u8>>,
+{
     let mut rng = StdRng::seed_from_u64(42);
     let mut batch = db.start_batch();
 
@@ -173,7 +185,6 @@ async fn gen_random_kv_batched<
     let iter = batch.into_iter();
     db.write_batch(iter).await.unwrap();
     db.commit().await.unwrap();
-    db.sync().await.unwrap();
     db.prune(db.inactivity_floor_loc()).await.unwrap();
 
     db

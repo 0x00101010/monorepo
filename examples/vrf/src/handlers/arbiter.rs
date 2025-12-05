@@ -27,7 +27,7 @@ pub struct Arbiter<E: Clock + Spawner, C: PublicKey> {
 /// Implementation of a "trusted arbiter" that tracks commitments,
 /// acknowledgements, and complaints during a DKG round.
 impl<E: Clock + Spawner, C: PublicKey> Arbiter<E, C> {
-    pub fn new(
+    pub const fn new(
         context: E,
         dkg_frequency: Duration,
         dkg_phase_timeout: Duration,
@@ -82,6 +82,11 @@ impl<E: Clock + Spawner, C: PublicKey> Arbiter<E, C> {
             1,
         );
         select_loop! {
+            self.context,
+            on_stopped => {
+                debug!("context shutdown, stopping arbiter");
+                return (None, HashSet::new());
+            },
             _ = self.context.sleep_until(timeout) => {
                 warn!(round, "timed out waiting for commitments");
                 break

@@ -6,8 +6,11 @@ use crate::{
     adb::{
         any::unordered::fixed::Any,
         current::{merkleize_grafted_bitmap, verify_key_value_proof, verify_range_proof, Config},
-        operation::{fixed::unordered::Operation, Keyed as _},
-        store::Db,
+        operation::{
+            fixed::{unordered::Operation, Value},
+            Keyed as _,
+        },
+        store::{Batchable, LogStore},
         Error,
     },
     mmr::{
@@ -18,10 +21,11 @@ use crate::{
     translator::Translator,
     AuthenticatedBitMap as BitMap,
 };
-use commonware_codec::{CodecFixed, FixedSize};
+use commonware_codec::FixedSize;
 use commonware_cryptography::{DigestOf, Hasher};
 use commonware_runtime::{Clock, Metrics, Storage as RStorage};
 use commonware_utils::Array;
+use core::ops::Range;
 use std::num::NonZeroU64;
 
 /// A key-value ADB based on an MMR over its log of operations, supporting authentication of whether
@@ -33,7 +37,7 @@ use std::num::NonZeroU64;
 pub struct Current<
     E: RStorage + Clock + Metrics,
     K: Array,
-    V: CodecFixed<Cfg = ()>,
+    V: Value,
     H: Hasher,
     T: Translator,
     const N: usize,
@@ -54,7 +58,7 @@ pub struct Current<
 
 /// The information required to verify a key value proof from a Current adb.
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub struct KeyValueProofInfo<K: Array, V: CodecFixed<Cfg = ()>, const N: usize> {
+pub struct KeyValueProofInfo<K: Array, V: Value, const N: usize> {
     /// The key whose value is being proven.
     pub key: K,
 
@@ -71,7 +75,7 @@ pub struct KeyValueProofInfo<K: Array, V: CodecFixed<Cfg = ()>, const N: usize> 
 impl<
         E: RStorage + Clock + Metrics,
         K: Array,
-        V: CodecFixed<Cfg = ()>,
+        V: Value,
         H: Hasher,
         T: Translator,
         const N: usize,
@@ -142,7 +146,7 @@ impl<
 
     /// Commit pending operations to the adb::any, ensuring their durability upon return from this
     /// function.
-    async fn commit_ops(&mut self) -> Result<(), Error> {
+    async fn commit_ops(&mut self, metadata: Option<V>) -> Result<(), Error> {
         // Inactivate the current commit operation.
         if let Some(last_commit_loc) = self.any.last_commit {
             self.status.set_bit(*last_commit_loc, false);
@@ -154,7 +158,7 @@ impl<
 
         // Append the commit operation with the new floor and tag it as active in the bitmap.
         self.status.push(true);
-        let commit_op = Operation::CommitFloor(inactivity_floor_loc);
+        let commit_op = Operation::CommitFloor(metadata, inactivity_floor_loc);
 
         self.any.apply_commit_op(commit_op).await
     }
@@ -331,34 +335,36 @@ impl<
     /// inactive operations, and bitmap state from being written/pruned.
     async fn simulate_commit_failure_after_any_db_commit(mut self) -> Result<(), Error> {
         // Only successfully complete operation (1) of the commit process.
-        self.commit_ops().await
+        self.commit_ops(None).await?;
+        Ok(())
     }
-}
 
-impl<
-        E: RStorage + Clock + Metrics,
-        K: Array,
-        V: CodecFixed<Cfg = ()>,
-        H: Hasher,
-        T: Translator,
-        const N: usize,
-    > Db<K, V> for Current<E, K, V, H, T, N>
-{
-    fn op_count(&self) -> Location {
+    /// The number of operations that have been applied to this db, including those that have been
+    /// pruned and those that are not yet committed.
+    pub fn op_count(&self) -> Location {
         self.any.op_count()
     }
 
-    fn inactivity_floor_loc(&self) -> Location {
+    /// Return the inactivity floor location. This is the location before which all operations are
+    /// known to be inactive. Operations before this point can be safely pruned.
+    pub const fn inactivity_floor_loc(&self) -> Location {
         self.any.inactivity_floor_loc()
     }
 
-    async fn get(&self, key: &K) -> Result<Option<V>, Error> {
+    /// Get the value of `key` in the db, or None if it has no value.
+    pub async fn get(&self, key: &K) -> Result<Option<V>, Error> {
         self.any.get(key).await
     }
 
-    async fn update(&mut self, key: K, value: V) -> Result<(), Error> {
-        let op = Operation::Update(key, value);
-        if let Some(old_loc) = self.any.update_key_with_op(op).await? {
+    /// Get the metadata associated with the last commit, or None if no commit has been made.
+    pub async fn get_metadata(&self) -> Result<Option<V>, Error> {
+        self.any.get_metadata().await
+    }
+
+    /// Updates `key` to have value `value`. The operation is reflected in the snapshot, but will be
+    /// subject to rollback until the next successful `commit`.
+    pub async fn update(&mut self, key: K, value: V) -> Result<(), Error> {
+        if let Some(old_loc) = self.any.update_key(key, value).await? {
             self.status.set_bit(*old_loc, false);
         }
         self.status.push(true);
@@ -366,7 +372,10 @@ impl<
         Ok(())
     }
 
-    async fn create(&mut self, key: K, value: V) -> Result<bool, Error> {
+    /// Creates a new key-value pair in the db. The operation is reflected in the snapshot, but will
+    /// be subject to rollback until the next successful `commit`. Returns true if the key was
+    /// created, false if it already existed.
+    pub async fn create(&mut self, key: K, value: V) -> Result<bool, Error> {
         if !self.any.create(key, value).await? {
             return Ok(false);
         }
@@ -375,8 +384,11 @@ impl<
         Ok(true)
     }
 
-    async fn delete(&mut self, key: K) -> Result<bool, Error> {
-        let Some(loc) = self.any.delete_key(Operation::Delete(key)).await? else {
+    /// Delete `key` and its value from the db. Deleting a key that already has no value is a no-op.
+    /// The operation is reflected in the snapshot, but will be subject to rollback until the next
+    /// successful `commit`. Returns true if the key was deleted, false if it was already inactive.
+    pub async fn delete(&mut self, key: K) -> Result<bool, Error> {
+        let Some(loc) = self.any.delete_key(key).await? else {
             return Ok(false);
         };
 
@@ -386,8 +398,16 @@ impl<
         Ok(true)
     }
 
-    async fn commit(&mut self) -> Result<(), Error> {
-        self.commit_ops().await?; // recovery is ensured after this returns
+    /// Commit any pending operations to the database, ensuring their durability upon return from
+    /// this function. Also raises the inactivity floor according to the schedule. Returns the
+    /// `(start_loc, end_loc]` location range of committed operations.
+    pub async fn commit(&mut self, metadata: Option<V>) -> Result<Range<Location>, Error> {
+        let start_loc = self
+            .any
+            .last_commit
+            .map_or_else(|| Location::new_unchecked(0), |last_commit| last_commit + 1);
+
+        self.commit_ops(metadata).await?; // recovery is ensured after this returns
 
         // Merkleize the new bitmap entries.
         let hasher = &mut self.any.log.hasher;
@@ -398,10 +418,11 @@ impl<
         // Prune bits that are no longer needed because they precede the inactivity floor.
         self.status.prune_to_bit(*self.any.inactivity_floor_loc())?;
 
-        Ok(())
+        Ok(start_loc..self.op_count())
     }
 
-    async fn sync(&mut self) -> Result<(), Error> {
+    /// Sync all database state to disk.
+    pub async fn sync(&mut self) -> Result<(), Error> {
         self.any.sync().await?;
 
         // Write the bitmap pruning boundary to disk so that next startup doesn't have to
@@ -415,7 +436,9 @@ impl<
             .map_err(Into::into)
     }
 
-    async fn prune(&mut self, prune_loc: Location) -> Result<(), Error> {
+    /// Prune historical operations prior to `prune_loc`. This does not affect the db's root
+    /// or current snapshot.
+    pub async fn prune(&mut self, prune_loc: Location) -> Result<(), Error> {
         // Write the pruned portion of the bitmap to disk *first* to ensure recovery in case of
         // failure during pruning. If we don't do this, we may not be able to recover the bitmap
         // because it may require replaying of pruned operations.
@@ -429,11 +452,14 @@ impl<
         self.any.prune(prune_loc).await
     }
 
-    async fn close(self) -> Result<(), Error> {
+    /// Close the db. Operations that have not been committed will be lost or rolled back on
+    /// restart.
+    pub async fn close(self) -> Result<(), Error> {
         self.any.close().await
     }
 
-    async fn destroy(self) -> Result<(), Error> {
+    /// Destroy the db, removing all data from disk.
+    pub async fn destroy(self) -> Result<(), Error> {
         // Clean up bitmap metadata partition.
         BitMap::<H::Digest, N>::destroy(self.context, &self.bitmap_metadata_partition).await?;
 
@@ -441,6 +467,123 @@ impl<
         self.any.destroy().await
     }
 }
+
+impl<
+        E: RStorage + Clock + Metrics,
+        K: Array,
+        V: Value,
+        H: Hasher,
+        T: Translator,
+        const N: usize,
+    > crate::store::StorePersistable for Current<E, K, V, H, T, N>
+{
+    async fn commit(&mut self) -> Result<(), Error> {
+        self.commit(None).await.map(|_| ())
+    }
+
+    async fn destroy(self) -> Result<(), Error> {
+        self.destroy().await
+    }
+}
+
+impl<
+        E: RStorage + Clock + Metrics,
+        K: Array,
+        V: Value,
+        H: Hasher,
+        T: Translator,
+        const N: usize,
+    > crate::adb::store::LogStorePrunable for Current<E, K, V, H, T, N>
+{
+    async fn prune(&mut self, prune_loc: Location) -> Result<(), Error> {
+        self.prune(prune_loc).await
+    }
+}
+
+impl<
+        E: RStorage + Clock + Metrics,
+        K: Array,
+        V: Value,
+        H: Hasher,
+        T: Translator,
+        const N: usize,
+    > LogStore for Current<E, K, V, H, T, N>
+{
+    type Value = V;
+
+    fn op_count(&self) -> Location {
+        self.op_count()
+    }
+
+    fn inactivity_floor_loc(&self) -> Location {
+        self.inactivity_floor_loc()
+    }
+
+    async fn get_metadata(&self) -> Result<Option<V>, Error> {
+        self.get_metadata().await
+    }
+
+    fn is_empty(&self) -> bool {
+        self.any.is_empty()
+    }
+}
+
+impl<
+        E: RStorage + Clock + Metrics,
+        K: Array,
+        V: Value,
+        H: Hasher,
+        T: Translator,
+        const N: usize,
+    > crate::store::Store for Current<E, K, V, H, T, N>
+{
+    type Key = K;
+    type Value = V;
+    type Error = Error;
+
+    async fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, Self::Error> {
+        self.get(key).await
+    }
+}
+
+impl<
+        E: RStorage + Clock + Metrics,
+        K: Array,
+        V: Value,
+        H: Hasher,
+        T: Translator,
+        const N: usize,
+    > crate::store::StoreMut for Current<E, K, V, H, T, N>
+{
+    async fn update(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Self::Error> {
+        self.update(key, value).await
+    }
+}
+
+impl<
+        E: RStorage + Clock + Metrics,
+        K: Array,
+        V: Value,
+        H: Hasher,
+        T: Translator,
+        const N: usize,
+    > crate::store::StoreDeletable for Current<E, K, V, H, T, N>
+{
+    async fn delete(&mut self, key: Self::Key) -> Result<bool, Self::Error> {
+        self.delete(key).await
+    }
+}
+
+impl<E, K, V, T, H, const N: usize> Batchable for Current<E, K, V, H, T, N>
+where
+    E: RStorage + Clock + Metrics,
+    K: Array,
+    V: Value,
+    T: Translator,
+    H: Hasher,
+{
+}
+
 #[cfg(test)]
 pub mod test {
     use super::*;
@@ -501,6 +644,7 @@ pub mod test {
             db.close().await.unwrap();
             db = open_db(context.clone(), partition).await;
             assert_eq!(db.op_count(), 0);
+            assert!(db.get_metadata().await.unwrap().is_none());
             assert_eq!(db.root(&mut hasher).await.unwrap(), root0);
             assert_eq!(root0, Mmr::empty_mmr_root(hasher.inner()));
 
@@ -509,13 +653,17 @@ pub mod test {
             let v1 = Sha256::hash(&10u64.to_be_bytes());
             assert!(db.create(k1, v1).await.unwrap());
             assert_eq!(db.get(&k1).await.unwrap().unwrap(), v1);
-            db.commit().await.unwrap();
+            let range = db.commit(None).await.unwrap();
+            assert_eq!(range.start, 0);
+            assert_eq!(range.end, 3);
+            assert!(db.get_metadata().await.unwrap().is_none());
             assert_eq!(db.op_count(), 3); // 1 update, 1 commit, 1 move.
             let root1 = db.root(&mut hasher).await.unwrap();
             assert!(root1 != root0);
             db.close().await.unwrap();
             db = open_db(context.clone(), partition).await;
             assert_eq!(db.op_count(), 3); // 1 update, 1 commit, 1 moves.
+            assert!(db.get_metadata().await.unwrap().is_none());
             assert_eq!(db.root(&mut hasher).await.unwrap(), root1);
 
             // Create of same key should fail.
@@ -523,8 +671,13 @@ pub mod test {
 
             // Delete that one key.
             assert!(db.delete(k1).await.unwrap());
-            db.commit().await.unwrap();
+            let metadata = Sha256::hash(&1u64.to_be_bytes());
+            let range = db.commit(Some(metadata)).await.unwrap();
+            assert_eq!(range.start, 3);
+            assert_eq!(range.end, 5);
+
             assert_eq!(db.op_count(), 5); // 1 update, 2 commits, 1 move, 1 delete.
+            assert_eq!(db.get_metadata().await.unwrap().unwrap(), metadata);
             let root2 = db.root(&mut hasher).await.unwrap();
 
             // Repeated delete of same key should fail.
@@ -534,6 +687,7 @@ pub mod test {
             db.close().await.unwrap();
             db = open_db(context.clone(), partition).await;
             assert_eq!(db.op_count(), 5);
+            assert_eq!(db.get_metadata().await.unwrap().unwrap(), metadata);
             assert_eq!(db.root(&mut hasher).await.unwrap(), root2);
 
             // Confirm all activity bits are false except for the last commit.
@@ -591,7 +745,7 @@ pub mod test {
             assert_eq!(db.any.snapshot.items(), 857);
 
             // Test that commit + sync w/ pruning will raise the activity floor.
-            db.commit().await.unwrap();
+            db.commit(None).await.unwrap();
             db.sync().await.unwrap();
             db.prune(db.inactivity_floor_loc()).await.unwrap();
             assert_eq!(db.op_count(), 1956);
@@ -637,7 +791,7 @@ pub mod test {
             let k = Sha256::fill(0x01);
             let v1 = Sha256::fill(0xA1);
             db.update(k, v1).await.unwrap();
-            db.commit().await.unwrap();
+            db.commit(None).await.unwrap();
 
             let op = db.any.get_key_op_loc(&k).await.unwrap().unwrap();
             let proof = db
@@ -672,7 +826,7 @@ pub mod test {
 
             // update the key to invalidate its previous update
             db.update(k, v2).await.unwrap();
-            db.commit().await.unwrap();
+            db.commit(None).await.unwrap();
 
             // Proof should not be verifiable against the new root.
             let root = db.root(&mut hasher).await.unwrap();
@@ -775,11 +929,11 @@ pub mod test {
             db.update(rand_key, v).await.unwrap();
             if commit_changes && rng.next_u32() % 20 == 0 {
                 // Commit every ~20 updates.
-                db.commit().await.unwrap();
+                db.commit(None).await.unwrap();
             }
         }
         if commit_changes {
-            db.commit().await.unwrap();
+            db.commit(None).await.unwrap();
         }
 
         Ok(())
@@ -942,7 +1096,7 @@ pub mod test {
                 let v = Sha256::fill(i);
                 db.update(k, v).await.unwrap();
                 assert_eq!(db.get(&k).await.unwrap().unwrap(), v);
-                db.commit().await.unwrap();
+                db.commit(None).await.unwrap();
                 let root = db.root(&mut hasher).await.unwrap();
 
                 // Create a proof for the current value of k.
@@ -1028,7 +1182,7 @@ pub mod test {
             apply_random_ops(ELEMENTS, false, rng_seed + 1, &mut db)
                 .await
                 .unwrap();
-            db.commit().await.unwrap();
+            db.commit(None).await.unwrap();
             db.prune(db.any.inactivity_floor_loc()).await.unwrap();
             // State from scenario #2 should match that of a successful commit.
             assert_eq!(db.root(&mut hasher).await.unwrap(), scenario_2_root);
@@ -1067,8 +1221,8 @@ pub mod test {
 
                 // Commit periodically
                 if i % 50 == 49 {
-                    db_no_pruning.commit().await.unwrap();
-                    db_pruning.commit().await.unwrap();
+                    db_no_pruning.commit(None).await.unwrap();
+                    db_pruning.commit(None).await.unwrap();
                     db_pruning
                         .prune(db_no_pruning.any.inactivity_floor_loc())
                         .await
@@ -1077,8 +1231,8 @@ pub mod test {
             }
 
             // Final commit
-            db_no_pruning.commit().await.unwrap();
-            db_pruning.commit().await.unwrap();
+            db_no_pruning.commit(None).await.unwrap();
+            db_pruning.commit(None).await.unwrap();
 
             // Get roots from both databases
             let root_no_pruning = db_no_pruning.root(&mut hasher).await.unwrap();
@@ -1118,18 +1272,10 @@ pub mod test {
 
     #[test_traced("DEBUG")]
     fn test_batch() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            batch_tests::run_batch_tests(|| {
-                let mut ctx = context.clone();
-                async move {
-                    let seed = ctx.next_u64();
-                    let prefix = format!("current_unordered_batch_{seed}");
-                    open_db(ctx, &prefix).await
-                }
-            })
-            .await
-            .unwrap();
+        batch_tests::test_batch(|mut ctx| async move {
+            let seed = ctx.next_u64();
+            let prefix = format!("current_unordered_batch_{seed}");
+            open_db(ctx, &prefix).await
         });
     }
 }

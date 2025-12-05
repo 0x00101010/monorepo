@@ -4,10 +4,7 @@ use arbitrary::Arbitrary;
 use commonware_cryptography::{sha256::Digest, Sha256};
 use commonware_runtime::{buffer::PoolRef, deterministic, Runner};
 use commonware_storage::{
-    adb::{
-        current::{ordered::Current, Config},
-        store::Db as _,
-    },
+    adb::current::{ordered::Current, Config},
     mmr::{hasher::Hasher as _, Location, Position, Proof, StandardHasher as Standard},
     translator::TwoCap,
 };
@@ -180,7 +177,7 @@ fn fuzz(data: FuzzInput) {
                 }
 
                 CurrentOperation::Commit => {
-                    db.commit().await.expect("Commit should not fail");
+                    db.commit(None).await.expect("Commit should not fail");
                     last_committed_op_count = db.op_count();
                     uncommitted_ops = 0;
                 }
@@ -191,7 +188,7 @@ fn fuzz(data: FuzzInput) {
 
                 CurrentOperation::Root => {
                     if uncommitted_ops > 0 {
-                        db.commit().await.expect("Commit before root should not fail");
+                        db.commit(None).await.expect("Commit before root should not fail");
                         last_committed_op_count = db.op_count();
                         uncommitted_ops = 0;
                     }
@@ -204,7 +201,7 @@ fn fuzz(data: FuzzInput) {
 
                     if current_op_count > 0 {
                         if uncommitted_ops > 0 {
-                            db.commit().await.expect("Commit before proof should not fail");
+                            db.commit(None).await.expect("Commit before proof should not fail");
                             last_committed_op_count = db.op_count();
                             uncommitted_ops = 0;
                         }
@@ -272,7 +269,7 @@ fn fuzz(data: FuzzInput) {
                     let k = Key::new(*key);
 
                     if uncommitted_ops > 0 {
-                        db.commit().await.expect("Commit before key value proof should not fail");
+                        db.commit(None).await.expect("Commit before key value proof should not fail");
                         last_committed_op_count = db.op_count();
                         uncommitted_ops = 0;
                     }
@@ -313,7 +310,7 @@ fn fuzz(data: FuzzInput) {
                     let k = Key::new(*key);
 
                     if uncommitted_ops > 0 {
-                        db.commit().await.expect("Commit before exclusion proof should not fail");
+                        db.commit(None).await.expect("Commit before exclusion proof should not fail");
                         last_committed_op_count = db.op_count();
                         uncommitted_ops = 0;
                     }
@@ -343,7 +340,7 @@ fn fuzz(data: FuzzInput) {
         }
 
         if uncommitted_ops > 0 {
-            db.commit().await.expect("Final commit should not fail");
+            db.commit(None).await.expect("Final commit should not fail");
         }
 
         for key in &all_keys {

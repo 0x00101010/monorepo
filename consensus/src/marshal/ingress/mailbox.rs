@@ -97,8 +97,10 @@ pub(crate) enum Message<S: Scheme, B: Block> {
         /// A channel to send the retrieved block.
         response: oneshot::Sender<B>,
     },
-    /// A request to broadcast a block to all peers.
-    Broadcast {
+    /// A request to broadcast a proposed block to all peers.
+    Proposed {
+        /// The round in which the block was proposed.
+        round: Round,
         /// The block to broadcast.
         block: B,
     },
@@ -145,7 +147,7 @@ pub struct Mailbox<S: Scheme, B: Block> {
 
 impl<S: Scheme, B: Block> Mailbox<S, B> {
     /// Creates a new mailbox.
-    pub(crate) fn new(sender: mpsc::Sender<Message<S, B>>) -> Self {
+    pub(crate) const fn new(sender: mpsc::Sender<Message<S, B>>) -> Self {
         Self { sender }
     }
 
@@ -166,13 +168,10 @@ impl<S: Scheme, B: Block> Mailbox<S, B> {
         {
             error!("failed to send get info message to actor: receiver dropped");
         }
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                error!("failed to get info: receiver dropped");
-                None
-            }
-        }
+        rx.await.unwrap_or_else(|_| {
+            error!("failed to get block info: receiver dropped");
+            None
+        })
     }
 
     /// A best-effort attempt to retrieve a given block from local
@@ -193,13 +192,10 @@ impl<S: Scheme, B: Block> Mailbox<S, B> {
         {
             error!("failed to send get block message to actor: receiver dropped");
         }
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                error!("failed to get block: receiver dropped");
-                None
-            }
-        }
+        rx.await.unwrap_or_else(|_| {
+            error!("failed to get block: receiver dropped");
+            None
+        })
     }
 
     /// A best-effort attempt to retrieve a given [Finalization] from local
@@ -220,13 +216,10 @@ impl<S: Scheme, B: Block> Mailbox<S, B> {
         {
             error!("failed to send get finalization message to actor: receiver dropped");
         }
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                error!("failed to get finalization: receiver dropped");
-                None
-            }
-        }
+        rx.await.unwrap_or_else(|_| {
+            error!("failed to get finalization: receiver dropped");
+            None
+        })
     }
 
     /// A request to retrieve a block by its commitment.
@@ -273,15 +266,15 @@ impl<S: Scheme, B: Block> Mailbox<S, B> {
             .map(|block| AncestorStream::new(self.clone(), [block]))
     }
 
-    /// Broadcast indicates that a block should be sent to all peers.
-    pub async fn broadcast(&mut self, block: B) {
+    /// Proposed requests that a proposed block is sent to all peers.
+    pub async fn proposed(&mut self, round: Round, block: B) {
         if self
             .sender
-            .send(Message::Broadcast { block })
+            .send(Message::Proposed { round, block })
             .await
             .is_err()
         {
-            error!("failed to send broadcast message to actor: receiver dropped");
+            error!("failed to send proposed message to actor: receiver dropped");
         }
     }
 

@@ -10,7 +10,7 @@ use commonware_runtime::{
     tokio::{Config, Context},
 };
 use commonware_storage::adb::{
-    store::{Batchable, Db},
+    store::{Batchable, LogStorePrunable},
     Error,
 };
 use criterion::{criterion_group, Criterion};
@@ -23,7 +23,7 @@ const COMMITS_PER_ITERATION: u64 = 100;
 /// Benchmark the generation of a large randomly generated any db.
 fn bench_variable_generate(c: &mut Criterion) {
     let cfg = Config::default();
-    let runner = tokio::Runner::new(cfg.clone());
+    let runner = tokio::Runner::new(cfg);
     for elements in [NUM_ELEMENTS, NUM_ELEMENTS * 10] {
         for operations in [NUM_OPERATIONS, NUM_OPERATIONS * 10] {
             for variant in VARIANTS {
@@ -82,15 +82,19 @@ fn bench_variable_generate(c: &mut Criterion) {
     }
 }
 
-async fn test_db<
-    A: Db<<Sha256 as Hasher>::Digest, Vec<u8>> + Batchable<<Sha256 as Hasher>::Digest, Vec<u8>>,
->(
+async fn test_db<A>(
     db: A,
     use_batch: bool,
     elements: u64,
     operations: u64,
     commit_frequency: u32,
-) -> Result<Duration, Error> {
+) -> Result<Duration, Error>
+where
+    A: Batchable
+        + commonware_storage::store::Store<Key = <Sha256 as Hasher>::Digest, Value = Vec<u8>>
+        + commonware_storage::store::StorePersistable
+        + LogStorePrunable<Value = Vec<u8>>,
+{
     let start = Instant::now();
     let db = if use_batch {
         gen_random_kv_batched(db, elements, operations, commit_frequency).await
